@@ -1,0 +1,41 @@
+[
+  {
+    "entry_type": "submission",
+    "content_id": "9cf7953f-cc00-4b31-b5d3-18c6fe3b4c7c",
+    "creator_id": "test-user-1",
+    "timestamp": "2026-06-29T06:35:34.202859+00:00",
+    "attribution": "likely_ai",
+    "confidence": 0.8,
+    "llm_score": 0.8,
+    "stylometric_score": null,
+    "burstiness_score": null,
+    "status": "classified",
+    "short_text_warning": true
+  },
+  {
+    "entry_type": "submission",
+    "content_id": "ccb5fa03-4f26-4f48-8016-46f1ae5867cf",
+    "creator_id": "test-user-1",
+    "timestamp": "2026-06-29T06:35:48.276934+00:00",
+    "attribution": "likely_ai",
+    "confidence": 0.85,
+    "llm_score": 0.85,
+    "stylometric_score": null,
+    "burstiness_score": null,
+    "status": "classified",
+    "short_text_warning": true
+  },
+  {
+    "entry_type": "submission",
+    "content_id": "8d030e75-7892-4eb4-93a9-e9e9a2d8c1a7",
+    "creator_id": "test-user-2",
+    "timestamp": "2026-06-29T06:36:14.557342+00:00",
+    "attribution": "likely_human",
+    "confidence": 0.2,
+    "llm_score": 0.2,
+    "stylometric_score": null,
+    "burstiness_score": null,
+    "status": "classified",
+    "short_text_warning": false
+  }
+]
