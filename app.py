@@ -1,7 +1,11 @@
 import os
 import json
 import uuid
+import math
+import string
+import re
 from datetime import datetime, timezone
+from collections import Counter
 
 from flask import Flask, request, jsonify
 from flask_limiter import Limiter
@@ -14,7 +18,7 @@ load_dotenv()
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Rate limiting (will enforce limits in Milestone 5 — set up now)
+# Rate limiting
 # ---------------------------------------------------------------------------
 limiter = Limiter(
     get_remote_address,
@@ -29,7 +33,7 @@ limiter = Limiter(
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # ---------------------------------------------------------------------------
-# Audit log (JSON file — simple, structured, no extra dependencies)
+# Audit log
 # ---------------------------------------------------------------------------
 LOG_FILE = "audit_log.json"
 
@@ -56,8 +60,7 @@ def append_log(entry):
 
 
 # ---------------------------------------------------------------------------
-# In-memory content store (maps content_id → entry for appeal lookups)
-# We also persist this to a JSON file so it survives restarts.
+# Content store
 # ---------------------------------------------------------------------------
 CONTENT_FILE = "content_store.json"
 
@@ -116,43 +119,167 @@ Text to analyze:
 
 
 def classify_with_llm(text: str) -> dict:
-    """
-    Calls Groq LLM to assess AI probability.
-    Returns {"score": float, "reasoning": str}
-    Score of 1.0 = highly likely AI-generated.
-    Score of 0.0 = highly likely human-written.
-    """
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "user",
-                    "content": LLM_PROMPT + text
-                }
-            ],
+            messages=[{"role": "user", "content": LLM_PROMPT + text}],
             temperature=0,
             max_tokens=200,
         )
         raw = response.choices[0].message.content.strip()
-
-        # Strip markdown fences if the model adds them anyway
         raw = raw.replace("```json", "").replace("```", "").strip()
-
         parsed = json.loads(raw)
         score = float(parsed.get("ai_probability", 0.5))
-        score = max(0.0, min(1.0, score))  # clamp to [0, 1]
-        reasoning = parsed.get("reasoning", "")
-        return {"score": score, "reasoning": reasoning}
-
+        score = max(0.0, min(1.0, score))
+        return {"score": score, "reasoning": parsed.get("reasoning", "")}
     except Exception as e:
-        # Fallback: neutral score if API call fails
         print(f"[LLM signal error] {e}")
         return {"score": 0.5, "reasoning": f"LLM signal unavailable: {str(e)}"}
 
 
 # ---------------------------------------------------------------------------
-# Transparency label (placeholder — full version in Milestone 5)
+# Signal 2: Stylometric Heuristics (pure Python)
+# ---------------------------------------------------------------------------
+
+def _split_sentences(text: str) -> list:
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s for s in sentences if len(s.split()) >= 2]
+
+
+def compute_stylometric_score(text: str) -> dict:
+    words = text.split()
+    sentences = _split_sentences(text)
+
+    if len(sentences) < 2 or len(words) < 10:
+        return {"score": 0.5, "details": {"note": "insufficient text for stylometric analysis"}}
+
+    # Metric 1: Sentence length variance (low = AI-like)
+    sent_lengths = [len(s.split()) for s in sentences]
+    mean_len = sum(sent_lengths) / len(sent_lengths)
+    variance = sum((l - mean_len) ** 2 for l in sent_lengths) / len(sent_lengths)
+    std_dev = math.sqrt(variance)
+    variance_score = max(0.0, 1.0 - (std_dev / 15.0))
+
+    # Metric 2: Type-token ratio (mid-range = AI-like)
+    clean_words = [w.lower().strip(string.punctuation) for w in words if w.strip(string.punctuation)]
+    ttr = len(set(clean_words)) / len(clean_words) if clean_words else 0.5
+    ttr_distance = abs(ttr - 0.62)
+    ttr_score = max(0.0, 1.0 - (ttr_distance / 0.38))
+
+    # Metric 3: Punctuation density (moderate = AI-like)
+    punct_chars = sum(1 for c in text if c in string.punctuation)
+    punct_density = punct_chars / len(text) if len(text) > 0 else 0
+    punct_distance = abs(punct_density - 0.075)
+    punct_score = max(0.0, 1.0 - (punct_distance / 0.075))
+
+    # Metric 4: Average sentence length (18-25 words = AI-like)
+    len_distance = abs(mean_len - 21.0)
+    len_score = max(0.0, 1.0 - (len_distance / 21.0))
+
+    combined = (
+        0.35 * variance_score +
+        0.25 * ttr_score +
+        0.20 * punct_score +
+        0.20 * len_score
+    )
+    combined = max(0.0, min(1.0, combined))
+
+    return {
+        "score": round(combined, 4),
+        "details": {
+            "sentence_count": len(sentences),
+            "avg_sentence_length": round(mean_len, 2),
+            "sentence_length_std_dev": round(std_dev, 2),
+            "type_token_ratio": round(ttr, 4),
+            "punctuation_density": round(punct_density, 4),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Signal 3: Burstiness Score (pure Python)
+# ---------------------------------------------------------------------------
+
+def compute_burstiness_score(text: str) -> dict:
+    stopwords = {
+        "the","a","an","and","or","but","in","on","at","to","for","of","with",
+        "by","from","is","are","was","were","be","been","it","this","that","i",
+        "you","he","she","we","they","my","your","his","her","its","our","their",
+        "not","as","so","if","do","did","have","has","had","will","would","can",
+        "could","should","may","might","what","how","when","where","who","which"
+    }
+    tokens = [
+        w.lower().strip(string.punctuation)
+        for w in text.split()
+        if w.lower().strip(string.punctuation) not in stopwords
+        and len(w.strip(string.punctuation)) > 2
+    ]
+
+    if len(tokens) < 20:
+        return {"score": 0.5, "details": {"note": "insufficient tokens for burstiness analysis"}}
+
+    freq = Counter(tokens)
+    repeated_words = [word for word, count in freq.items() if count >= 3]
+
+    if len(repeated_words) < 2:
+        return {"score": 0.5, "details": {"note": "insufficient repeated words", "vocab_size": len(freq)}}
+
+    burstiness_values = []
+    for word in repeated_words[:15]:
+        positions = [i for i, t in enumerate(tokens) if t == word]
+        if len(positions) < 3:
+            continue
+        intervals = [positions[i+1] - positions[i] for i in range(len(positions)-1)]
+        mean_interval = sum(intervals) / len(intervals)
+        if mean_interval == 0:
+            continue
+        variance = sum((x - mean_interval) ** 2 for x in intervals) / len(intervals)
+        cv = math.sqrt(variance) / mean_interval
+        word_burst_score = max(0.0, 1.0 - min(cv, 2.0) / 2.0)
+        burstiness_values.append(word_burst_score)
+
+    if not burstiness_values:
+        return {"score": 0.5, "details": {"note": "could not compute burstiness", "vocab_size": len(freq)}}
+
+    final_score = sum(burstiness_values) / len(burstiness_values)
+    return {
+        "score": round(max(0.0, min(1.0, final_score)), 4),
+        "details": {
+            "token_count": len(tokens),
+            "vocab_size": len(freq),
+            "words_analyzed": len(burstiness_values),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ensemble Confidence Scoring
+# ---------------------------------------------------------------------------
+LLM_WEIGHT = 0.50
+STYLO_WEIGHT = 0.30
+BURST_WEIGHT = 0.20
+
+
+def combine_signals(llm_score: float, stylo_score: float, burst_score: float) -> float:
+    combined = (
+        LLM_WEIGHT * llm_score +
+        STYLO_WEIGHT * stylo_score +
+        BURST_WEIGHT * burst_score
+    )
+    return round(max(0.0, min(1.0, combined)), 4)
+
+
+def score_to_attribution(confidence: float) -> str:
+    if confidence >= 0.70:
+        return "likely_ai"
+    elif confidence >= 0.40:
+        return "uncertain"
+    else:
+        return "likely_human"
+
+
+# ---------------------------------------------------------------------------
+# Transparency Label
 # ---------------------------------------------------------------------------
 def generate_label(confidence: float, certificate: bool = False) -> str:
     if certificate:
@@ -179,15 +306,6 @@ def generate_label(confidence: float, certificate: bool = False) -> str:
         )
 
 
-def score_to_attribution(confidence: float) -> str:
-    if confidence >= 0.70:
-        return "likely_ai"
-    elif confidence >= 0.40:
-        return "uncertain"
-    else:
-        return "likely_human"
-
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -207,74 +325,150 @@ def submit():
     if not creator_id:
         return jsonify({"error": "Missing required field: creator_id"}), 400
 
-    # Short text warning
     word_count = len(text.split())
     short_text_warning = word_count < 50
 
-    # --- Signal 1: LLM ---
+    # Run all three signals
     llm_result = classify_with_llm(text)
     llm_score = llm_result["score"]
 
-    # Milestone 3: use LLM score as placeholder confidence
-    # (Signals 2 & 3 added in Milestone 4)
-    confidence = llm_score
+    stylo_result = compute_stylometric_score(text)
+    stylo_score = stylo_result["score"]
+
+    burst_result = compute_burstiness_score(text)
+    burst_score = burst_result["score"]
+
+    # Ensemble confidence
+    confidence = combine_signals(llm_score, stylo_score, burst_score)
+
+    # Short text: cap at uncertain to avoid confident mislabeling
+    if short_text_warning and confidence >= 0.70:
+        confidence = 0.69
+
     attribution = score_to_attribution(confidence)
     label = generate_label(confidence)
 
     content_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Build audit log entry
     log_entry = {
         "entry_type": "submission",
         "content_id": content_id,
         "creator_id": creator_id,
         "timestamp": timestamp,
         "attribution": attribution,
-        "confidence": round(confidence, 4),
+        "confidence": confidence,
         "llm_score": round(llm_score, 4),
-        "stylometric_score": None,   # filled in Milestone 4
-        "burstiness_score": None,    # filled in Milestone 4
+        "stylometric_score": round(stylo_score, 4),
+        "burstiness_score": round(burst_score, 4),
         "status": "classified",
         "short_text_warning": short_text_warning,
     }
     append_log(log_entry)
 
-    # Store for appeal lookups
     store_content(content_id, {
         "creator_id": creator_id,
         "attribution": attribution,
-        "confidence": round(confidence, 4),
+        "confidence": confidence,
         "status": "classified",
         "timestamp": timestamp,
     })
 
-    response = {
+    return jsonify({
         "content_id": content_id,
         "attribution": attribution,
-        "confidence": round(confidence, 4),
+        "confidence": confidence,
         "signal_scores": {
             "llm": round(llm_score, 4),
-            "stylometric": None,
-            "burstiness": None,
+            "stylometric": round(stylo_score, 4),
+            "burstiness": round(burst_score, 4),
         },
         "label": label,
         "short_text_warning": short_text_warning,
+    }), 200
+
+
+@app.route("/appeal", methods=["POST"])
+def appeal():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    content_id = data.get("content_id", "").strip()
+    creator_reasoning = data.get("creator_reasoning", "").strip()
+
+    if not content_id:
+        return jsonify({"error": "Missing required field: content_id"}), 400
+    if not creator_reasoning:
+        return jsonify({"error": "Missing required field: creator_reasoning"}), 400
+
+    content = get_content(content_id)
+    if not content:
+        return jsonify({"error": f"No content found with id: {content_id}"}), 404
+
+    update_content_status(content_id, "under_review")
+
+    appeal_entry = {
+        "entry_type": "appeal",
+        "content_id": content_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "creator_reasoning": creator_reasoning,
+        "original_attribution": content["attribution"],
+        "original_confidence": content["confidence"],
+        "status": "under_review",
     }
-    return jsonify(response), 200
+    append_log(appeal_entry)
+
+    return jsonify({
+        "message": "Appeal received and logged. Your content has been marked for human review.",
+        "content_id": content_id,
+        "status": "under_review",
+    }), 200
 
 
 @app.route("/log", methods=["GET"])
 def get_log():
     entries = read_log()
-    # Return most recent 50 entries
     return jsonify({"entries": entries[-50:], "total": len(entries)}), 200
 
 
-@app.route("/appeal", methods=["POST"])
-def appeal():
-    # Stub — fully implemented in Milestone 5
-    return jsonify({"message": "Appeals endpoint coming in Milestone 5"}), 200
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    entries = read_log()
+    submissions = [e for e in entries if e.get("entry_type") == "submission"]
+    appeals = [e for e in entries if e.get("entry_type") == "appeal"]
+    total = len(submissions)
+
+    if total == 0:
+        return jsonify({"message": "No submissions yet"}), 200
+
+    verdict_distribution = {
+        "likely_ai": sum(1 for e in submissions if e.get("attribution") == "likely_ai"),
+        "uncertain": sum(1 for e in submissions if e.get("attribution") == "uncertain"),
+        "likely_human": sum(1 for e in submissions if e.get("attribution") == "likely_human"),
+    }
+
+    appeal_rate = round(len(appeals) / total, 4)
+    avg_confidence = round(sum(e.get("confidence", 0) for e in submissions) / total, 4)
+
+    agreement_count = 0
+    for e in submissions:
+        llm = e.get("llm_score", 0.5)
+        sty = e.get("stylometric_score", 0.5)
+        bur = e.get("burstiness_score", 0.5)
+        if llm is not None and sty is not None and bur is not None:
+            if (llm >= 0.5 and sty >= 0.5 and bur >= 0.5) or (llm < 0.5 and sty < 0.5 and bur < 0.5):
+                agreement_count += 1
+    signal_agreement_rate = round(agreement_count / total, 4)
+
+    return jsonify({
+        "total_submissions": total,
+        "total_appeals": len(appeals),
+        "verdict_distribution": verdict_distribution,
+        "appeal_rate": appeal_rate,
+        "avg_confidence": avg_confidence,
+        "signal_agreement_rate": signal_agreement_rate,
+    }), 200
 
 
 @app.route("/health", methods=["GET"])
@@ -284,4 +478,4 @@ def health():
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5001)
